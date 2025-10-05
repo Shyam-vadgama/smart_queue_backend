@@ -21,7 +21,7 @@ logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
 # --- CONFIGURATION ---
 # IMPORTANT: Replace these connection details with your actual PostgreSQL credentials.
 # Format: postgresql+psycopg2://user:password@host:port/dbname
-DATABASE_URL = "postgresql+psycopg2://postgres:admin@localhost:5432/smart_queue"
+DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET_KEY = "$2a$12$2DB3EJ9Eulsdg6i8kiohl.al3rlBNjWXCgghVBKt.cvJmCFCpuNhG"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
