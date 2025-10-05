@@ -6,17 +6,20 @@ from passlib.context import CryptContext
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 # Importing only the necessary SQLAlchemy models and enums from the local package
-from .models import Base, User, Organization, Service, Queue, Feedback, Role as UserRole
+from models import Base, User, Organization, Service, Queue, Feedback, Role as UserRole
 from pydantic import BaseModel, constr, conint, validator
 from typing import Optional
 import asyncio
 from fastapi import Form
 from enum import Enum as PyEnum
 import logging
+import os
+from dotenv import load_dotenv
 
 # Set up logging for better debugging
 logging.basicConfig()
 logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
+load_dotenv()
 
 # --- CONFIGURATION ---
 # IMPORTANT: Replace these connection details with your actual PostgreSQL credentials.
