@@ -15,12 +15,10 @@ from fastapi import Form
 from enum import Enum as PyEnum
 import logging
 import os
-from dotenv import load_dotenv
 
 # Set up logging for better debugging
 logging.basicConfig()
 logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
-load_dotenv()
 
 # --- CONFIGURATION ---
 # IMPORTANT: Replace these connection details with your actual PostgreSQL credentials.
