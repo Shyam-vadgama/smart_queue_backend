@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from passlib.context import CryptContext
@@ -50,6 +51,10 @@ class UserCreate(BaseModel):
         except ValueError:
             raise ValueError("Invalid role")
         return value
+
+class OrganizationCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
 
 class ServiceCreate(BaseModel):
     service_name: constr(min_length=1, max_length=255)
@@ -210,25 +215,92 @@ async def rate_limit_middleware(request: Request, call_next):
 async def root():
     return {"message": "Hello World"}
 
+@app.post("/organizations", status_code=status.HTTP_201_CREATED)
+async def create_organization(
+    org: OrganizationCreate, 
+    db: Session = Depends(get_db)
+):
+    """
+    Endpoint to create a new organization.
+    """
+    # Check if organization with the same name already exists
+    existing_org = db.query(Organization).filter(
+        Organization.OrganizationName == org.name
+    ).first()
+    
+    if existing_org:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Organization with name '{org.name}' already exists"
+        )
+    
+    # Create new organization
+    new_org = Organization(
+        OrganizationName=org.name,
+        Description=org.description
+    )
+    
+    db.add(new_org)
+    db.commit()
+    db.refresh(new_org)
+    
+    return {
+        "message": "Organization created successfully",
+        "organization_id": new_org.OrganizationID,
+        "organization_name": new_org.OrganizationName
+    }
+
 @app.post("/register")
 async def register_user(user: UserCreate, db: Session = Depends(get_db)):
     """
     Endpoint for registering a new user.
+    For admin registration, an organization_id must be provided.
+    For non-admin users, they'll be added to the specified organization.
     """
-    # Check if organization exists, if not use default organization (ID 1)
-    organization = db.query(Organization).filter(Organization.OrganizationID == user.organization_id).first()
-    if not organization:
-        # Use default organization
-        default_org = db.query(Organization).filter(Organization.OrganizationID == 1).first()
-        if not default_org:
-            raise HTTPException(status_code=500, detail="Default organization not found")
-        organization_id = default_org.OrganizationID
-    else:
-        organization_id = user.organization_id
+    # Check if user is trying to register as admin
+    is_admin = user.role.lower() == "admin"
     
-    existing_user = db.query(User).filter((User.Username == user.username) | (User.Email == user.email)).first()
+    # For admin registration, organization_id is required
+    if is_admin and not user.organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Organization ID is required for admin registration"
+        )
+    
+    # Check if organization exists
+    organization = None
+    if user.organization_id:
+        organization = db.query(Organization).filter(
+            Organization.OrganizationID == user.organization_id
+        ).first()
+        
+        if not organization:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Organization with ID {user.organization_id} not found"
+            )
+    else:
+        # For non-admin users, use default organization if none specified
+        organization = db.query(Organization).filter(
+            Organization.OrganizationID == 1
+        ).first()
+        
+        if not organization:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Default organization not found"
+            )
+    
+    # Check if username or email already exists
+    existing_user = db.query(User).filter(
+        (User.Username == user.username) | (User.Email == user.email)
+    ).first()
+    
     if existing_user:
-        raise HTTPException(status_code=400, detail="Username or email already exists")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username or email already exists"
+        )
 
     # Hash the password
     hashed_password = get_password_hash(user.password)
@@ -239,14 +311,15 @@ async def register_user(user: UserCreate, db: Session = Depends(get_db)):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid role")
 
+    # Create new user with the organization
     new_user = User(
-        Username=user.username, 
-        Password=hashed_password, 
-        Email=user.email, 
-        FirstName=user.first_name, 
-        LastName=user.last_name, 
-        Role=role_enum, 
-        OrganizationID=organization_id
+        Username=user.username,
+        Password=hashed_password,
+        Email=user.email,
+        FirstName=user.first_name,
+        LastName=user.last_name,
+        Role=role_enum,
+        OrganizationID=organization.OrganizationID
     )
     db.add(new_user)
     db.commit()
@@ -286,7 +359,7 @@ async def read_own_items(current_user: User = Depends(get_current_active_user)):
     return [{"item_id": "Foo", "owner": current_user.Username}]
 
 @app.post("/customer/join_queue/{service_id}")
-async def join_queue(service_id: int, customer_id: int, db: Session = Depends(get_db)):
+async def join_queue(service_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     """
     Endpoint for a customer to join a queue for a specific service.
     """
@@ -294,19 +367,40 @@ async def join_queue(service_id: int, customer_id: int, db: Session = Depends(ge
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    customer = db.query(User).filter(User.UserID == customer_id).first()
-    if not customer:
-        raise HTTPException(status_code=404, detail="Customer not found")
+    # The customer is the current authenticated user
+    customer = current_user
     
     last_token = db.query(Queue).filter(Queue.ServiceID == service_id).order_by(Queue.TokenNumber.desc()).first()
     token_number = last_token.TokenNumber + 1 if last_token else 1
 
-    new_token = Queue(CustomerID=customer_id, ServiceID=service_id, TokenNumber=token_number, Status="waiting")
+    new_token = Queue(CustomerID=customer.UserID, ServiceID=service_id, TokenNumber=token_number, Status="waiting")
     db.add(new_token)
     db.commit()
     db.refresh(new_token)
 
-    return {"message": "Joined queue successfully", "token_number": new_token.TokenNumber}
+    return {"message": "Joined queue successfully", "token_number": new_token.TokenNumber, "queue_id": new_token.TokenID}
+
+@app.get("/customer/queue_status/{queue_id}")
+async def get_queue_status(queue_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """
+    Endpoint for a customer to get the status of a queue they are in.
+    """
+    token = db.query(Queue).filter(Queue.TokenID == queue_id, Queue.CustomerID == current_user.UserID).first()
+    if not token:
+        raise HTTPException(status_code=404, detail="Token not found")
+
+    # Calculate position in queue
+    position = db.query(Queue).filter(
+        Queue.ServiceID == token.ServiceID,
+        Queue.Status == "waiting",
+        Queue.TokenNumber < token.TokenNumber
+    ).count() + 1
+
+    return {
+        "token_number": token.TokenNumber,
+        "status": token.Status.value,
+        "position": position
+    }
 
 @app.post("/customer/feedback", dependencies=[Depends(get_current_active_user)])
 async def submit_feedback(feedback: FeedbackCreate, db: Session = Depends(get_db)):
@@ -327,6 +421,30 @@ async def submit_feedback(feedback: FeedbackCreate, db: Session = Depends(get_db
     db.refresh(new_feedback)
 
     return {"message": "Feedback submitted successfully"}
+
+@app.get("/services")
+async def get_all_services(db: Session = Depends(get_db)):
+    """
+    Public endpoint for customers to browse all available services.
+    """
+    services = db.query(Service).all()
+    return services
+
+@app.get("/staff/services", dependencies=[Depends(has_role(UserRole.staff))])
+async def get_staff_services(db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """
+    Endpoint for staff to get the services for their organization.
+    """
+    services = db.query(Service).filter(Service.OrganizationID == current_user.OrganizationID).all()
+    return services
+
+@app.get("/staff/queue/{service_id}", dependencies=[Depends(has_role(UserRole.staff))])
+async def get_staff_queue(service_id: int, db: Session = Depends(get_db)):
+    """
+    Endpoint for staff to get the queue for a specific service.
+    """
+    queue = db.query(Queue).filter(Queue.ServiceID == service_id).order_by(Queue.TokenNumber.asc()).all()
+    return queue
 
 @app.post("/staff/token/call_next/{service_id}", dependencies=[Depends(has_role(UserRole.staff))])
 async def call_next_token(service_id: int, db: Session = Depends(get_db)):
@@ -383,28 +501,141 @@ async def set_token_priority(token_id: int, priority: int, db: Session = Depends
     return {"message": "Token priority updated successfully"}
 
 @app.get("/admin/analytics", dependencies=[Depends(has_role(UserRole.admin))])
-async def get_analytics(db: Session = Depends(get_db)):
+async def get_analytics(db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     """
     Endpoint for admin to get analytics about the queue system.
     """
-    # TODO: Implement analytics logic
-    return {"message": "Analytics endpoint is not yet implemented."}
+    # Get total counts
+    total_users = db.query(User).filter(User.OrganizationID == current_user.OrganizationID).count()
+    total_services = db.query(Service).filter(Service.OrganizationID == current_user.OrganizationID).count()
+    total_tokens = db.query(Queue).filter(Queue.service.has(organization_id=current_user.OrganizationID)).count()
+
+    # Get status distribution
+    status_counts = db.query(Queue.Status, func.count(Queue.Status)).filter(
+        Queue.service.has(organization_id=current_user.OrganizationID)
+    ).group_by(Queue.Status).all()
+
+    # Get service usage
+    service_usage = db.query(Service.ServiceName, func.count(Queue.TokenID)).join(Queue).filter(
+        Service.OrganizationID == current_user.OrganizationID
+    ).group_by(Service.ServiceName).all()
+
+    # Get daily token creation trend (last 7 days)
+    from datetime import datetime, timedelta
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+
+    daily_trends = db.query(
+        func.date(Queue.CreatedAt).label('date'),
+        func.count(Queue.TokenID).label('count')
+    ).filter(
+        Queue.CreatedAt >= seven_days_ago,
+        Queue.service.has(organization_id=current_user.OrganizationID)
+    ).group_by(func.date(Queue.CreatedAt)).all()
+
+    # Get average ratings per service
+    service_ratings = db.query(
+        Service.ServiceName,
+        func.avg(Feedback.Rating).label('avg_rating'),
+        func.count(Feedback.FeedbackID).label('feedback_count')
+    ).join(Feedback).filter(
+        Service.OrganizationID == current_user.OrganizationID
+    ).group_by(Service.ServiceName).all()
+
+    # Format the data
+    analytics_data = {
+        "overview": {
+            "total_users": total_users,
+            "total_services": total_services,
+            "total_tokens": total_tokens,
+            "active_tokens": db.query(Queue).filter(
+                Queue.Status.in_(["waiting", "in_service"]),
+                Queue.service.has(organization_id=current_user.OrganizationID)
+            ).count()
+        },
+        "status_distribution": {
+            status.value: count for status, count in status_counts
+        },
+        "service_usage": {
+            service_name: count for service_name, count in service_usage
+        },
+        "daily_trends": {
+            str(date): count for date, count in daily_trends
+        },
+        "service_ratings": {
+            service_name: {
+                "average_rating": float(avg_rating) if avg_rating else 0,
+                "feedback_count": feedback_count
+            } for service_name, avg_rating, feedback_count in service_ratings
+        }
+    }
+
+    return analytics_data
+
+@app.get("/admin/services", dependencies=[Depends(has_role(UserRole.admin))])
+async def get_services(db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """
+    Endpoint for admin to get all services for their organization.
+    """
+    services = db.query(Service).filter(Service.OrganizationID == current_user.OrganizationID).all()
+    return services
 
 @app.post("/admin/service/create", dependencies=[Depends(has_role(UserRole.admin))])
-async def create_service(service: ServiceCreate, db: Session = Depends(get_db)):
+async def create_service(
+    service: ServiceCreate, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
     """
     Endpoint for admin to create a new service.
+    The organization_id must match the admin's organization.
     """
-    organization = db.query(Organization).filter(Organization.OrganizationID == service.organization_id).first()
-    if not organization:
-        raise HTTPException(status_code=404, detail="Organization not found")
+    # Validate that the organization_id matches the admin's organization
+    if service.organization_id != current_user.OrganizationID:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only create services for your own organization"
+        )
 
-    new_service = Service(ServiceName=service.service_name, Description=service.description, OrganizationID=service.organization_id)
+    # Check if organization exists
+    organization = db.query(Organization).filter(
+        Organization.OrganizationID == service.organization_id
+    ).first()
+    
+    if not organization:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Organization with ID {service.organization_id} not found"
+        )
+
+    # Check if service with same name already exists in the organization
+    existing_service = db.query(Service).filter(
+        Service.ServiceName == service.service_name,
+        Service.OrganizationID == service.organization_id
+    ).first()
+    
+    if existing_service:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Service with name '{service.service_name}' already exists in your organization"
+        )
+
+    # Create the new service
+    new_service = Service(
+        ServiceName=service.service_name, 
+        Description=service.description, 
+        OrganizationID=service.organization_id
+    )
+    
     db.add(new_service)
     db.commit()
     db.refresh(new_service)
 
-    return {"message": "Service created successfully"}
+    return {
+        "message": "Service created successfully",
+        "service_id": new_service.ServiceID,
+        "service_name": new_service.ServiceName,
+        "organization_id": new_service.OrganizationID
+    }
 
 @app.put("/admin/service/update/{service_id}", dependencies=[Depends(has_role(UserRole.admin))])
 async def update_service(service_id: int, service: ServiceUpdate, db: Session = Depends(get_db)):
@@ -527,3 +758,11 @@ async def delete_employee(employee_id: int, db: Session = Depends(get_db)):
     db.commit()
 
     return {"message": "Employee deleted successfully"}
+
+@app.get("/admin/employees", dependencies=[Depends(has_role(UserRole.admin))])
+async def get_employees(db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    """
+    Endpoint for admin to get all employees for their organization.
+    """
+    employees = db.query(User).filter(User.OrganizationID == current_user.OrganizationID, User.Role != UserRole.customer).all()
+    return employees
