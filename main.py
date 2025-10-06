@@ -1,20 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Body
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
-from jose import JWTError, jwt
-from datetime import datetime, timedelta
-from passlib.context import CryptContext
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-# Importing only the necessary SQLAlchemy models and enums from the local package
-from models import Base, User, Organization, Service, Queue, Feedback, Role as UserRole
-from pydantic import BaseModel, constr, conint, validator
-from typing import Optional
-import asyncio
-from fastapi import Form
-from enum import Enum as PyEnum
-import logging
-import os
+import qrcode
+import io
+import base64
+from PIL import Image
 
 # Set up logging for better debugging
 logging.basicConfig()
@@ -378,27 +365,58 @@ async def join_queue(service_id: int, db: Session = Depends(get_db), current_use
 
     return {"message": "Joined queue successfully", "token_number": new_token.TokenNumber, "queue_id": new_token.TokenID}
 
-@app.get("/customer/queue_status/{queue_id}")
-async def get_queue_status(queue_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+@app.post("/customer/join_queue_qr")
+async def join_queue_via_qr(qr_data: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     """
-    Endpoint for a customer to get the status of a queue they are in.
+    Endpoint for customers to join a queue by scanning a QR code.
+    QR data format: QUEUE_JOIN:service_id:service_name
     """
-    token = db.query(Queue).filter(Queue.TokenID == queue_id, Queue.CustomerID == current_user.UserID).first()
-    if not token:
-        raise HTTPException(status_code=404, detail="Token not found")
+    try:
+        # Parse QR data
+        if not qr_data.startswith("QUEUE_JOIN:"):
+            raise HTTPException(status_code=400, detail="Invalid QR code format")
 
-    # Calculate position in queue
-    position = db.query(Queue).filter(
-        Queue.ServiceID == token.ServiceID,
-        Queue.Status == "waiting",
-        Queue.TokenNumber < token.TokenNumber
-    ).count() + 1
+        parts = qr_data.split(":")
+        if len(parts) < 3:
+            raise HTTPException(status_code=400, detail="Invalid QR code data")
 
-    return {
-        "token_number": token.TokenNumber,
-        "status": token.Status.value,
-        "position": position
-    }
+        service_id = int(parts[1])
+        service_name = ":".join(parts[2:])  # Handle service names with colons
+
+        # Verify service exists
+        service = db.query(Service).filter(Service.ServiceID == service_id).first()
+        if not service:
+            raise HTTPException(status_code=404, detail="Service not found")
+
+        if service.ServiceName != service_name:
+            raise HTTPException(status_code=400, detail="Service name mismatch")
+
+        # Get the next token number for this service
+        last_token = db.query(Queue).filter(Queue.ServiceID == service_id).order_by(Queue.TokenNumber.desc()).first()
+        token_number = last_token.TokenNumber + 1 if last_token else 1
+
+        # Create new queue entry
+        new_token = Queue(
+            CustomerID=current_user.UserID,
+            ServiceID=service_id,
+            TokenNumber=token_number,
+            Status="waiting"
+        )
+        db.add(new_token)
+        db.commit()
+        db.refresh(new_token)
+
+        return {
+            "message": "Successfully joined queue via QR code",
+            "token_number": new_token.TokenNumber,
+            "queue_id": new_token.TokenID,
+            "service_name": service.ServiceName
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid service ID in QR code")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error joining queue: {str(e)}")
 
 @app.post("/customer/feedback", dependencies=[Depends(get_current_active_user)])
 async def submit_feedback(feedback: FeedbackCreate, db: Session = Depends(get_db)):
@@ -420,13 +438,42 @@ async def submit_feedback(feedback: FeedbackCreate, db: Session = Depends(get_db
 
     return {"message": "Feedback submitted successfully"}
 
-@app.get("/services")
-async def get_all_services(db: Session = Depends(get_db)):
+@app.get("/service/qr/{service_id}")
+async def generate_service_qr(service_id: int, db: Session = Depends(get_db)):
     """
-    Public endpoint for customers to browse all available services.
+    Endpoint to generate a QR code for a service that customers can scan to join the queue.
     """
-    services = db.query(Service).all()
-    return services
+    service = db.query(Service).filter(Service.ServiceID == service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    # Create QR code data containing service information
+    qr_data = f"QUEUE_JOIN:{service_id}:{service.ServiceName}"
+
+    # Generate QR code
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(qr_data)
+    qr.make(fit=True)
+
+    # Create QR code image
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    # Convert to base64 for JSON response
+    img_buffer = io.BytesIO()
+    img.save(img_buffer, format='PNG')
+    img_str = base64.b64encode(img_buffer.getvalue()).decode()
+
+    return {
+        "qr_code": f"data:image/png;base64,{img_str}",
+        "service_id": service_id,
+        "service_name": service.ServiceName,
+        "qr_data": qr_data
+    }
 
 @app.get("/staff/services", dependencies=[Depends(has_role(UserRole.staff))])
 async def get_staff_services(db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
