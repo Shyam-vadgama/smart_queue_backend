@@ -362,6 +362,16 @@ async def read_users_me(current_user: User = Depends(get_current_active_user)):
 async def read_own_items(current_user: User = Depends(get_current_active_user)):
     return [{"item_id": "Foo", "owner": current_user.Username}]
 
+@app.get("/services")
+async def get_all_services(db: Session = Depends(get_db)):
+    """
+    Endpoint for customers to get a list of all available services across all organizations.
+    """
+    services = db.query(Service).order_by(Service.OrganizationID, Service.ServiceName).all()
+    if not services:
+        raise HTTPException(status_code=404, detail="No services are currently available")
+    return services
+
 @app.post("/customer/join_queue/{service_id}")
 async def join_queue(service_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
     """
@@ -830,3 +840,4 @@ async def get_employees(db: Session = Depends(get_db), current_user: User = Depe
     """
     employees = db.query(User).filter(User.OrganizationID == current_user.OrganizationID, User.Role != UserRole.customer).all()
     return employees
+
