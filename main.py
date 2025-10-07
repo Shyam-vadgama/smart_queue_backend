@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from passlib.context import CryptContext
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker, Session
 # Importing only the necessary SQLAlchemy models and enums from the local package
 from models import Base, User, Organization, Service, Queue, Feedback, Role as UserRole
@@ -15,10 +15,16 @@ from fastapi import Form
 from enum import Enum as PyEnum
 import logging
 import os
+import io
+import base64
+
+import qrcode
+
 
 # Set up logging for better debugging
 logging.basicConfig()
 logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
+
 
 # --- CONFIGURATION ---
 # IMPORTANT: Replace these connection details with your actual PostgreSQL credentials.
